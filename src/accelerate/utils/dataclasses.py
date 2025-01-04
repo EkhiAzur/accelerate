@@ -1910,6 +1910,10 @@ class MegatronLMPlugin:
     tp_degree: int = field(default=None, metadata={"help": "tensor parallelism degree."})
     pp_degree: int = field(default=None, metadata={"help": "pipeline parallelism degree."})
     num_micro_batches: int = field(default=None, metadata={"help": "number of micro-batches."})
+    global_batch_size: int = field(
+        default=None,
+        metadata={"help": "global batch size."}
+    )
     gradient_clipping: float = field(
         default=None, metadata={"help": "gradient clipping value based on global L2 Norm (0 to disable)"}
     )
@@ -2080,6 +2084,8 @@ class MegatronLMPlugin:
             self.pp_degree = int(os.environ.get(prefix + "PP_DEGREE", 1))
         if self.num_micro_batches is None:
             self.num_micro_batches = int(os.environ.get(prefix + "NUM_MICRO_BATCHES", 1))
+        if self.global_batch_size is None:
+            self.global_batch_size = int(os.environ.get(prefix + "GLOBAL_BATCH_SIZE", 1))
         if self.gradient_clipping is None:
             self.gradient_clipping = float(os.environ.get(prefix + "GRADIENT_CLIPPING", 1.0))
         if self.recompute_activations is None:
@@ -2112,6 +2118,7 @@ class MegatronLMPlugin:
             "sequence_parallel": self.sequence_parallelism,
             "clip_grad": self.gradient_clipping,
             "num_micro_batches": self.num_micro_batches,
+            "global_batch_size": self.global_batch_size,
             "consumed_samples": self.consumed_samples,
             "no_wd_decay_cond": self.no_wd_decay_cond,
             "scale_lr_cond": self.scale_lr_cond,
@@ -2151,10 +2158,9 @@ class MegatronLMPlugin:
     def set_training_args(self, micro_batch_size, dp_degree):
         self.data_parallel_size = dp_degree
         self.micro_batch_size = micro_batch_size
-        self.global_batch_size = dp_degree * micro_batch_size * self.num_micro_batches
         self.megatron_lm_default_args["data_parallel_size"] = self.data_parallel_size
         self.megatron_lm_default_args["micro_batch_size"] = self.micro_batch_size
-        self.megatron_lm_default_args["global_batch_size"] = self.global_batch_size
+        self.gradient_accumulation_steps = self.global_batch_size // (self.micro_batch_size * self.num_micro_batches * self.data_parallel_size)
 
     def set_optimizer_type(self, optimizer):
         optimizer_name = optimizer.__class__.__name__.lower()
@@ -2254,6 +2260,7 @@ def parse_bert_config(megatron_lm_plugin, model, batch_data):
         megatron_lm_plugin.seq_length = max_position_embeddings
     megatron_lm_plugin.megatron_lm_default_args["seq_length"] = megatron_lm_plugin.seq_length
     megatron_lm_plugin.megatron_lm_default_args["model_type_name"] = model_type_name
+    megatron_lm_plugin.megatron_lm_default_args["return_logits"] = megatron_lm_plugin.return_logits
     megatron_lm_plugin.megatron_lm_default_args["num_layers"] = num_layers
     megatron_lm_plugin.megatron_lm_default_args["hidden_size"] = hidden_size
     megatron_lm_plugin.megatron_lm_default_args["num_attention_heads"] = num_attention_heads
@@ -2293,6 +2300,39 @@ def parse_gpt2_config(megatron_lm_plugin, model, batch_data):
     megatron_lm_plugin.megatron_lm_default_args["max_position_embeddings"] = max_position_embeddings
     megatron_lm_plugin.megatron_lm_default_args["pretraining_flag"] = pretraining_flag
     megatron_lm_plugin.megatron_lm_default_args["orig_vocab_size"] = orig_vocab_size
+    megatron_lm_plugin.megatron_lm_default_args["model_return_dict"] = model.config.return_dict
+
+@add_model_config_to_megatron_parser("llama")
+def parse_llama_config(megatron_lm_plugin, model, batch_data):
+    model_type_name = "gpt"
+    num_layers = model.config.num_hidden_layers
+    pretraining_flag = True
+    hidden_size = model.config.hidden_size
+    num_attention_heads = model.config.num_attention_heads
+    orig_vocab_size = model.config.vocab_size
+
+    max_position_embeddings = model.config.max_position_embeddings
+    seq_length = getattr(model.config, "max_sequence_length", None)
+    if megatron_lm_plugin.seq_length is None:
+        if seq_length is not None:
+            megatron_lm_plugin.seq_length = seq_length
+        elif megatron_lm_plugin.decoder_seq_length is not None:
+            megatron_lm_plugin.seq_length = megatron_lm_plugin.decoder_seq_length
+        elif batch_data is not None:
+            megatron_lm_plugin.seq_length = batch_data["input_ids"].shape[1]
+        else:
+            megatron_lm_plugin.seq_length = max_position_embeddings
+
+    megatron_lm_plugin.megatron_lm_default_args["return_logits"] = megatron_lm_plugin.return_logits
+    megatron_lm_plugin.megatron_lm_default_args["tokenizer_type"] = "Llama2Tokenizer"
+    megatron_lm_plugin.megatron_lm_default_args["model_type_name"] = model_type_name
+    megatron_lm_plugin.megatron_lm_default_args["num_layers"] = num_layers
+    megatron_lm_plugin.megatron_lm_default_args["pretraining_flag"] = pretraining_flag
+    megatron_lm_plugin.megatron_lm_default_args["hidden_size"] = hidden_size
+    megatron_lm_plugin.megatron_lm_default_args["num_attention_heads"] = num_attention_heads
+    megatron_lm_plugin.megatron_lm_default_args["orig_vocab_size"] = orig_vocab_size
+    megatron_lm_plugin.megatron_lm_default_args["max_position_embeddings"] = max_position_embeddings
+    megatron_lm_plugin.megatron_lm_default_args["seq_length"] = megatron_lm_plugin.seq_length
     megatron_lm_plugin.megatron_lm_default_args["model_return_dict"] = model.config.return_dict
 
 

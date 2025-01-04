@@ -83,7 +83,12 @@ class AcceleratedScheduler:
 
     # Passthroughs
     def get_last_lr(self):
-        return self.scheduler.get_last_lr()
+        if hasattr(self.scheduler, "get_last_lr"):
+            return self.scheduler.get_last_lr()
+        else: # Megatron scheduler does not have get_last_lr
+            for param_group in self.optimizers[0].param_groups:
+                learning_rate = param_group['lr']
+            return [learning_rate]
 
     def state_dict(self):
         return self.scheduler.state_dict()

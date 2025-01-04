@@ -292,12 +292,18 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> Dict[str, str]:
         current_env[prefix + "GRADIENT_CLIPPING"] = str(args.megatron_lm_gradient_clipping)
         if args.megatron_lm_num_micro_batches is not None:
             current_env[prefix + "NUM_MICRO_BATCHES"] = str(args.megatron_lm_num_micro_batches)
+        if args.megatron_lm_global_batch_size is not None:
+            current_env[prefix + "GLOBAL_BATCH_SIZE"] = str(args.megatron_lm_global_batch_size)
         if args.megatron_lm_sequence_parallelism is not None:
             current_env[prefix + "SEQUENCE_PARALLELISM"] = str(args.megatron_lm_sequence_parallelism)
         if args.megatron_lm_recompute_activations is not None:
             current_env[prefix + "RECOMPUTE_ACTIVATIONS"] = str(args.megatron_lm_recompute_activations)
         if args.megatron_lm_use_distributed_optimizer is not None:
             current_env[prefix + "USE_DISTRIBUTED_OPTIMIZER"] = str(args.megatron_lm_use_distributed_optimizer)
+        if args.megatron_lm_args_path is not None:
+            current_env[prefix + "ARGS_PATH"] = str(args.megatron_lm_args_path)
+        if args.megatron_model_config_path is not None:
+            current_env[prefix + "MODEL_CONFIG_PATH"] = str(args.megatron_model_config_path)
 
     current_env["OMP_NUM_THREADS"] = str(args.num_cpu_threads_per_process)
     if args.enable_cpu_affinity:

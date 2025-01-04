@@ -1893,6 +1893,7 @@ class Accelerator:
         micro_batch_size = None
         if not megatron_lm_plugin.megatron_dataset_flag:
             batch_sizes = [obj.batch_size for obj in args if hasattr(obj, "batch_size")]
+            batch_sizes = [bt for bt in batch_sizes if bt is not None] # Ensure that all batch sizes are not None
             if len(batch_sizes) == 0:
                 raise ValueError(
                     "You must specify a training or evaluation dataloader in `accelerate.prepare()` when using Megatron-LM."

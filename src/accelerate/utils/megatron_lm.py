@@ -17,6 +17,8 @@ import math
 import os
 from abc import ABC
 from functools import partial
+import json
+import yaml
 
 import torch
 import torch.nn.functional as F
@@ -39,13 +41,17 @@ if is_megatron_lm_available():
     from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_model_parallel_src_rank
     from megatron.core.pipeline_parallel import get_forward_backward_func
     from megatron.core.utils import get_model_config
+    from megatron.core.dist_checkpointing.core import CheckpointingException
     from megatron.inference.text_generation.communication import broadcast_int_list, broadcast_tensor
     from megatron.inference.text_generation.generation import (
         beam_search_and_return_on_first_stage,
         generate_tokens_probs_and_return_on_first_stage,
     )
     from megatron.legacy.data.dataset_utils import build_train_valid_test_datasets
-    from megatron.legacy.model import BertModel, Float16Module, GPTModel, T5Model
+    from megatron.legacy.model import Float16Module, LLamaModel
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.models.bert.bert_model import BertModel
+    from megatron.core.models.T5.t5_model import T5Model
     from megatron.legacy.model.classification import Classification
     from megatron.training import (
         get_args,
@@ -85,57 +91,53 @@ if is_megatron_lm_available():
         get_ltor_masks_and_position_ids,
         unwrap_model,
     )
+def load_arguments_from_file(args_path):
+    """Load arguments from a file in JSON or YAML format."""
+    if args_path.endswith('.json'):
+        with open(args_path, 'r') as f:
+            args = json.load(f)
+
+    elif args_path.endswith('.yaml'):
+        with open(args_path, 'r') as yaml_file:
+            args = yaml.safe_load(yaml_file)
+
+    else:
+        raise ValueError(f"Unknown file type for args file: {args_path}. Only YAML and JSON are supported.")
+
+    return args
+
+def parse_args_and_read_config_files(*args, **kwargs):
+    """Parse arguments and read config files."""
+    args = parse_args(*args, **kwargs)
+    args_path = os.environ.get('MEGATRON_LM_ARGS_PATH', False)
+    if args_path:
+        file_args = load_arguments_from_file(args_path)
+    else:
+        file_args = {}
+    model_args_path = os.environ.get('MEGATRON_LM_MODEL_CONFIG_PATH', False)
+    if model_args_path:
+        model_file_args = load_arguments_from_file(model_args_path)
+    else:
+        model_file_args = {}
+    file_args_model_args = {**file_args, **model_file_args}
+    for key, value in file_args_model_args.items():
+        setattr(args, key.replace("-", "_"), value)
+    return args
 
 
 # model utilities
 def model_provider_func(pre_process=True, post_process=True, add_encoder=True, add_decoder=True):
     """Build the model."""
     args = get_args()
-    mode = "pre-training" if args.pretraining_flag else "fine-tuning"
-    if args.rank == 0:
-        print(f"Building {args.model_type_name} model in the {mode} mode.")
-        print(
-            "The Megatron LM model weights are initialized at random in `accelerator.prepare`. "
-            "Please use `accelerator.load_checkpoint` to load a pre-trained checkpoint matching the distributed setup."
-        )
-    config = core_transformer_config_from_args(args)
     if args.model_type_name == "bert":
-        if args.pretraining_flag:
-            num_tokentypes = 2 if args.bert_binary_head else 0
-            model = BertModel(
-                config=config,
-                num_tokentypes=num_tokentypes,
-                add_binary_head=args.bert_binary_head,
-                parallel_output=True,
-                pre_process=pre_process,
-                post_process=post_process,
-            )
-        else:
-            model = Classification(
-                config=config,
-                num_classes=args.num_labels,
-                num_tokentypes=2,
-                pre_process=pre_process,
-                post_process=post_process,
-            )
+        from pretrain_bert import model_provider
+        model = model_provider(pre_process=pre_process, post_process=post_process)
     elif args.model_type_name == "gpt":
-        model = GPTModel(
-            config=config,
-            num_tokentypes=0,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process,
-        )
+        from pretrain_gpt import model_provider
+        model = model_provider(pre_process=pre_process, post_process=post_process)
     elif args.model_type_name == "t5":
-        model = T5Model(
-            config=config,
-            num_tokentypes=0,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process,
-            add_encoder=add_encoder,
-            add_decoder=add_decoder,
-        )
+        from pretrain_t5 import model_provider
+        model = model_provider(pre_process=pre_process, post_process=post_process, add_encoder=add_encoder, add_decoder=add_decoder)
     else:
         raise ValueError(f"Unsupported model type: {args.model_type_name}")
     return model
@@ -306,19 +308,19 @@ def prepare_data_loader(accelerator, dataloader):
     if not args.megatron_dataset_flag:
         from ..data_loader import _PYTORCH_DATALOADER_KWARGS, prepare_data_loader
 
-        micro_batch_size = args.micro_batch_size * args.num_micro_batches
+        megatron_batch_size = args.micro_batch_size * args.num_micro_batches * accelerator.state.megatron_lm_plugin.gradient_accumulation_steps
         kwargs = {k: getattr(dataloader, k, _PYTORCH_DATALOADER_KWARGS[k]) for k in _PYTORCH_DATALOADER_KWARGS}
         if kwargs["batch_size"] is None:
             if isinstance(kwargs["sampler"], torch.utils.data.BatchSampler):
-                kwargs["sampler"].batch_size = micro_batch_size
+                kwargs["sampler"].batch_size = megatron_batch_size
             else:
                 del kwargs["sampler"]
                 del kwargs["shuffle"]
                 del kwargs["batch_size"]
-                kwargs["batch_sampler"].batch_size = micro_batch_size
+                kwargs["batch_sampler"].batch_size = megatron_batch_size
         else:
             del kwargs["batch_sampler"]
-            kwargs["batch_size"] = micro_batch_size
+            kwargs["batch_size"] = megatron_batch_size
 
         dataloader = torch.utils.data.DataLoader(dataloader.dataset, **kwargs)
         # split_batches:
@@ -343,7 +345,8 @@ def prepare_data_loader(accelerator, dataloader):
             ) = args.consumed_samples
         else:
             args.consumed_train_samples, args.consumed_valid_samples, args.consumed_test_samples = 0, 0, 0
-        args.micro_batch_size = args.micro_batch_size * args.num_micro_batches
+        og_micro_batch_size = args.micro_batch_size
+        args.micro_batch_size = args.micro_batch_size * args.num_micro_batches * accelerator.state.megatron_lm_plugin.gradient_accumulation_steps
         # In order to be compatible with data in transform format,
         # it needs to increase the size of mbs first,
         # and then split the large batch data into some mbs.
@@ -352,7 +355,7 @@ def prepare_data_loader(accelerator, dataloader):
             valid_data_iterator,
             test_data_iterator,
         ) = dataloader.build_train_valid_test_data_iterators(accelerator)
-        args.micro_batch_size = args.micro_batch_size // args.num_micro_batches
+        args.micro_batch_size = og_micro_batch_size
 
         train_data_iterator = _handle_megatron_data_iterator(
             accelerator=accelerator, data_iterator=train_data_iterator
@@ -424,6 +427,25 @@ def prepare_scheduler(accelerator, optimizer, scheduler):
     accelerator.print("Preparing scheduler")
     scheduler = get_optimizer_param_scheduler(optimizer)
     return scheduler
+
+class MegatronDummyModel(torch.nn.Module):
+
+    def __init__(self, config = None):
+        super().__init__()
+        self.config = config
+    
+    @classmethod
+    def from_pretrained(self, pretrained_model_name_or_path, **kwargs):
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        return self(config)
+    
+    @classmethod
+    def from_config(self, config, **kwargs):
+        return self(config)
+
+    def forward(self, input_ids = None, attention_mask = None, labels = None, **kwargs):
+        return None
 
 
 class AbstractTrainStep(ABC):
@@ -866,7 +888,7 @@ def finish_mpu_init():
     # torch.distributed initialization
     args = get_args()
     # Pytorch distributed.
-    _initialize_distributed()
+    _initialize_distributed(get_embedding_ranks=None, get_position_embedding_ranks=None)
 
     # Random seeds for reproducibility.
     if args.rank == 0:
@@ -880,7 +902,7 @@ def initialize(accelerator, extra_args_provider=None, args_defaults={}):
     assert torch.cuda.is_available(), "Megatron requires CUDA."
 
     # Parse arguments
-    args = parse_args(extra_args_provider, ignore_unknown_args=True)
+    args = parse_args_and_read_config_files(extra_args_provider, ignore_unknown_args=True)
 
     # Set defaults
     for key, value in args_defaults.items():
@@ -900,7 +922,7 @@ def initialize(accelerator, extra_args_provider=None, args_defaults={}):
 
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
-    set_global_variables(args)
+    set_global_variables(args, build_tokenizer=False)
 
     # Megatron's MPU is the master. Complete initialization right away.
     finish_mpu_init()
@@ -964,6 +986,20 @@ class MegatronEngine(torch.nn.Module):
         self.module_config = None
         if args.tensorboard_dir is not None:
             write_args_to_tensorboard()
+                    
+        # Load argument should be set to load the model with the weights, otherwise it will start training from scratch
+        if getattr(args, "load", None) != None:
+            self.load_checkpoint()
+        
+        self.first_save_done = False
+        self.output_dirs = []
+
+        # Batch size information
+        self.micro_batch_size = args.micro_batch_size
+        self.num_micro_batches = args.num_micro_batches
+        self.global_batch_size = args.global_batch_size
+        self.dp_degree = accelerator.state.megatron_lm_plugin.data_parallel_size
+        self.gradient_accumulation_steps = accelerator.state.megatron_lm_plugin.gradient_accumulation_steps
 
     def get_module_config(self):
         args = get_args()
@@ -978,11 +1014,7 @@ class MegatronEngine(torch.nn.Module):
             config.no_sync_func = [model_chunk.no_sync for model_chunk in self.module]
             if len(self.module) == 1:
                 config.no_sync_func = config.no_sync_func[0]
-            if args.delay_grad_reduce:
-                config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in self.module]
-                if len(self.module) == 1:
-                    config.grad_sync_func = config.grad_sync_func[0]
-        if args.overlap_param_gather and args.delay_param_gather:
+        if args.overlap_param_gather:
             config.param_sync_func = [
                 lambda x: self.optimizer.finish_param_sync(model_index, x) for model_index in range(len(self.module))
             ]
@@ -1010,15 +1042,23 @@ class MegatronEngine(torch.nn.Module):
     def get_batch_data_iterator(self, batch_data):
         args = get_args()
         data_chunks = []
+        add_num_items_in_batch = False
+        if "num_items_in_batch" in batch_data:
+            num_items_in_batch = batch_data.pop("num_items_in_batch")
+            add_num_items_in_batch = True
+           
         if len(batch_data) > 0:
-            if args.num_micro_batches > 1:
-                for i in range(0, args.num_micro_batches):
+            num_micro_batches = args.num_micro_batches * self.gradient_accumulation_steps
+            if (num_micro_batches) > 1:
+                for i in range(0, num_micro_batches):
                     data_chunks.append(
                         {
                             k: v[i * args.micro_batch_size : (i + 1) * args.micro_batch_size]
                             for k, v in batch_data.items()
                         }
                     )
+                    if add_num_items_in_batch:
+                        data_chunks[-1]["num_items_in_batch"] = num_items_in_batch
             else:
                 data_chunks = [batch_data]
 
@@ -1042,7 +1082,7 @@ class MegatronEngine(torch.nn.Module):
 
         batch_data_iterator = self.get_batch_data_iterator(batch_data)
 
-        loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad = train_step(
+        loss_reduced, skipped_iter, _, _, _, grad_norm, num_zeros_in_grad = train_step(
             forward_step_func=self.train_step_handler.forward_step,
             data_iterator=batch_data_iterator,
             model=self.module,
@@ -1189,18 +1229,27 @@ class MegatronEngine(torch.nn.Module):
         args = get_args()
         args.save = output_dir
         torch.distributed.barrier()
-        save_checkpoint(
-            self.iteration,
-            self.module,
-            self.optimizer,
-            self.scheduler,
-            num_floating_point_operations_so_far=self.num_floating_point_operations_so_far,
-        )
+        try:
+            save_checkpoint(
+                self.iteration,
+                self.module,
+                self.optimizer,
+                self.scheduler,
+                num_floating_point_operations_so_far=self.num_floating_point_operations_so_far,
+            )
+            self.first_save_done = True
+        except CheckpointingException as e:
+            if self.first_save_done:
+                print(f"Checkpointing failed: {e}")
+                print("If this is the last epoch of training, you can safely ignore this error.")
+            else:
+                raise e
         torch.distributed.barrier()
 
-    def load_checkpoint(self, input_dir):
+    def load_checkpoint(self, input_dir = None):
         args = get_args()
-        args.load = input_dir
+        if input_dir is not None:
+            args.load = input_dir
         args.consumed_train_samples = 0
         args.consumed_valid_samples = 0
         torch.distributed.barrier()
@@ -1210,6 +1259,12 @@ class MegatronEngine(torch.nn.Module):
         self.num_floating_point_operations_so_far = num_floating_point_operations_so_far
         if args.fp16 and self.iteration == 0:
             self.optimizer.reload_model_params()
+    
+    def state_dict(self):        
+        if hasattr(self.base_model, "sharded_state_dict"): # Core models
+            return self.base_model.sharded_state_dict()
+        else: # Legacy models
+            return self.base_model.state_dict_for_save_checkpoint()
 
     def megatron_generate(
         self,

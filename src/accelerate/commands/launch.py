@@ -610,6 +610,12 @@ def launch_command_parser(subparsers=None):
         help="Megatron-LM's number of micro batches when PP degree > 1. (useful only when `use_megatron_lm` flag is passed).",
     )
     megatron_lm_args.add_argument(
+        "--megatron_lm_global_batch_size",
+        type=int,
+        default=None,
+        help="Megatron-LM's global batch size. (useful only when `use_megatron_lm` flag is passed).",
+    )
+    megatron_lm_args.add_argument(
         "--megatron_lm_sequence_parallelism",
         default=None,
         type=str,
@@ -636,6 +642,20 @@ def launch_command_parser(subparsers=None):
         default=1.0,
         type=float,
         help="Megatron-LM's gradient clipping value based on global L2 Norm (0 to disable). "
+        "(useful only when `use_megatron_lm` flag is passed).",
+    )
+    megatron_lm_args.add_argument(
+        "--megatron_lm_args_path",
+        default=None,
+        type=str,
+        help="Path to the yaml file containing Megatron-LM arguments."
+        "(useful only when `use_megatron_lm` flag is passed).",
+    )
+    megatron_lm_args.add_argument(
+        "--megatron_model_config_path",
+        default=None,
+        type=str,
+        help="Path to the yaml file containing Megatron-LM model configuration."
         "(useful only when `use_megatron_lm` flag is passed).",
     )
 
